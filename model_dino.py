@@ -3,69 +3,53 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 class DINOv3Depth(nn.Module):
-    def __init__(self, output_size=(64, 64)):
+    def __init__(self, output_size=(224, 224)):
         super().__init__()
         self.output_size = output_size
 
-        # --- 1. The Backbone ---
-        print("Loading DINOv3 (DINOv2) backbone...")
+        # 1. Backbone
         self.backbone = torch.hub.load('facebookresearch/dinov2', 'dinov2_vitl14', pretrained=True)
-
-        # Freeze the backbone
         for param in self.backbone.parameters():
             param.requires_grad = False
-
         self.embed_dim = self.backbone.embed_dim
 
-        # --- 2. The Decoder ---
-        # We need 4 upsamples to go from feature map (4x4) to Output (64x64)
-        # 4 -> 8 -> 16 -> 32 -> 64
+        # 2. Decoder (16x16 -> 224x224)
+        # We need to upsample 16 -> 32 -> 64 -> 112 -> 224?
+        # Actually 224/14 = 16 patches.
+        # 16 -> 32 -> 64 -> 128 -> 256 (Too big!)
+        # Let's do 3 upsamples (16->32->64->128) then Resize, or 4 upsamples with smaller kernels.
+        # Simplest robust way: 4 blocks of 2x upsampling with a final resize.
+
         self.decoder = nn.Sequential(
-            nn.Conv2d(self.embed_dim, 512, kernel_size=3, padding=1),
-            nn.ReLU(),
-            nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False), # 4 -> 8
+            nn.Conv2d(self.embed_dim, 512, 3, padding=1), nn.ReLU(),
+            nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False), # 32
 
-            nn.Conv2d(512, 256, kernel_size=3, padding=1),
-            nn.ReLU(),
-            nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False), # 8 -> 16
+            nn.Conv2d(512, 256, 3, padding=1), nn.ReLU(),
+            nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False), # 64
 
-            nn.Conv2d(256, 128, kernel_size=3, padding=1),
-            nn.ReLU(),
-            nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False), # 16 -> 32
+            nn.Conv2d(256, 128, 3, padding=1), nn.ReLU(),
+            nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False), # 128
 
-            nn.Conv2d(128, 64, kernel_size=3, padding=1),
-            nn.ReLU(),
-            nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False), # 32 -> 64
+            nn.Conv2d(128, 64, 3, padding=1), nn.ReLU(),
+            nn.Upsample(scale_factor=1.75, mode='bilinear', align_corners=False), # 128 -> 224
 
-            nn.Conv2d(64, 1, kernel_size=1)
+            nn.Conv2d(64, 1, 1)
         )
 
     def forward(self, x):
-        # x input is (B, 3, 64, 64)
+        # Input is now (B, 3, 224, 224) - Native DINO size!
         B, C, H, W = x.shape
 
-        # --- THE FIX ---
-        # DINO needs multiples of 14.
-        # Closest to 64 is 56 (14x4) or 70 (14x5).
-        # We choose 56 because our decoder does 16x upsampling (4 -> 64).
-        # If we chose 70, we'd get 5x5 features -> 80x80 output (mismatch).
-        x_dino = F.interpolate(x, size=(56, 56), mode='bilinear', align_corners=False)
-
-        # 1. Forward pass through DINO
         with torch.no_grad():
-            features_dict = self.backbone.forward_features(x_dino)
-            patch_tokens = features_dict['x_norm_patchtokens'] # (B, 16, C) because 4*4=16 patches
+            features_dict = self.backbone.forward_features(x)
+            patch_tokens = features_dict['x_norm_patchtokens']
+            # (B, 256, 1024) -> (B, 1024, 16, 16)
+            feature_map = patch_tokens.permute(0, 2, 1).reshape(B, self.embed_dim, 16, 16)
 
-            # Reshape tokens: (B, 16, 1024) -> (B, 1024, 4, 4)
-            # We hardcode 4x4 because we forced input to 56x56
-            feature_map = patch_tokens.permute(0, 2, 1).reshape(B, self.embed_dim, 4, 4)
-
-        # 2. Decode
-        # 4x4 -> 64x64
         depth = self.decoder(feature_map)
 
-        # 3. Safety Resize (just in case)
-        if depth.shape[-2:] != self.output_size:
-            depth = F.interpolate(depth, size=self.output_size, mode='bilinear', align_corners=False)
+        # Force exact match
+        if depth.shape[-1] != 224:
+            depth = F.interpolate(depth, size=(224, 224), mode='bilinear', align_corners=False)
 
         return depth

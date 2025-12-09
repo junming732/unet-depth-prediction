@@ -20,23 +20,24 @@ args = parser.parse_args()
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 DATA_PATH = '/proj/uppmax2025-2-346/nobackup/private/junming/nyu_depth_v2/extracted_data'
 
-# Transforms for DINO
+# --- THE FIX: Resize to 224x224 (High Res) ---
 dino_transform = transforms.Compose([
-    transforms.Resize((64, 64)),
+    transforms.Resize((224, 224)),  # <--- WAS 64, NOW 224
     transforms.ToTensor(),
     transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
 ])
 
 # Initialize Model & Loader
 if args.model_type == 'unet':
+    # UNet keeps using 64x64 (Low Res)
     test_dataset = NYUDataset(DATA_PATH, 'test', rgb_transform=rgb_data_transforms, depth_transform=depth_data_transforms)
     model = UNet().to(device)
 
 elif args.model_type == 'dinov3':
     from dataset import NYUDepthDataset
+    # DINO uses 224x224 (High Res)
     test_dataset = NYUDepthDataset(DATA_PATH, split='test', transform=dino_transform)
-    # DINO was trained with output (64,64)
-    model = DINOv3Depth(output_size=(64, 64)).to(device)
+    model = DINOv3Depth(output_size=(224, 224)).to(device)
 
 test_loader = DataLoader(test_dataset, batch_size=32, shuffle=False)
 
@@ -48,23 +49,21 @@ model.eval()
 
 # --- Metrics Calculation ---
 def compute_metrics(output, target):
-    # Both models were trained on Log-Depth.
-    # We must convert BOTH to Linear Meters for fair comparison.
-
     if args.model_type == 'unet':
-        pred = torch.exp(output) # UNet predicts Log
-        gt = torch.exp(target)   # UNet Loader returns Log
+        pred = torch.exp(output)
+        gt = torch.exp(target)
     else:
-        # --- THE FIX IS HERE ---
-        pred = torch.exp(output) # DINO predicts Log (we added this in training)
-        gt = target              # DINO Loader returns Linear (dataset.py default)
+        # DINO output is already Log-Depth (from Scale Invariant Training)
+        # So we exp() it to get meters.
+        pred = torch.exp(output)
+        gt = target # Loader gives Linear meters
 
-    # DINO Ground Truth Resize Fix
-    # If shapes don't match (64x64 vs 480x640), resize GT to prediction
+    # DINO RESIZE FIX:
+    # If prediction is 224x224 and GT is 480x640, resize GT to match prediction
     if pred.shape != gt.shape:
         gt = F.interpolate(gt, size=pred.shape[-2:], mode='bilinear', align_corners=False)
 
-    # Avoid div by zero / NaNs
+    # Avoid div by zero
     gt = gt.clamp(min=1e-3)
     pred = pred.clamp(min=1e-3)
 

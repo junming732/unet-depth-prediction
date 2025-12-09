@@ -7,8 +7,8 @@ from torchvision import transforms
 
 # --- Benchmark Settings ---
 # The UNet paper uses a tiny 64x64 output. We keep this to match the benchmark exactly.
-output_height = 64
-output_width = 64
+output_height = 224  # Was 64
+output_width = 224  # Was 64
 
 # --- Transforms ---
 class TransposeDepthInput(object):
