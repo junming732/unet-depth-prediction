@@ -9,3 +9,6 @@ logs/
 *.DS_Store
 imran_plots/
 nyu_depth_v2_labeled.mat
+
+venv
+checkpoints/
